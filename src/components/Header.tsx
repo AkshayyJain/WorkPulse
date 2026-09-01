@@ -14,9 +14,11 @@ import {
   Menu,
   X,
   Sparkles,
+  Database as DatabaseIcon,
 } from 'lucide-react';
 import { formatWeekRange, getReportingWeek } from '../utils/dateUtils';
 import { api } from '../services/api';
+import { DatabaseStatusModal } from './DatabaseStatusModal';
 
 interface HeaderProps {
   currentTab: 'dashboard' | 'history' | 'docs';
@@ -29,6 +31,7 @@ export function Header({ currentTab, onSelectTab, onRefreshData }: HeaderProps) 
   const { theme, toggleTheme } = useTheme();
   const [isResetting, setIsResetting] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [dbModalOpen, setDbModalOpen] = useState(false);
   const { weekStart, weekEnd } = getReportingWeek();
 
   const handleResetDemo = async () => {
@@ -155,6 +158,17 @@ export function Header({ currentTab, onSelectTab, onRefreshData }: HeaderProps) 
                 <Moon className="w-3.5 h-3.5" />
               </button>
             </div>
+
+            {/* Database Engine Status Button */}
+            <button
+              id="btn-db-status"
+              onClick={() => setDbModalOpen(true)}
+              title="Inspect Database & Collections Status"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/60 border border-emerald-200 dark:border-emerald-800 transition-colors text-xs font-semibold"
+            >
+              <DatabaseIcon className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+              <span>DB Engine</span>
+            </button>
 
             {/* Reset Seed Data */}
             <button
@@ -302,6 +316,12 @@ export function Header({ currentTab, onSelectTab, onRefreshData }: HeaderProps) 
           </div>
         </div>
       )}
+
+      {/* Database Diagnostics Modal */}
+      <DatabaseStatusModal
+        isOpen={dbModalOpen}
+        onClose={() => setDbModalOpen(false)}
+      />
     </header>
   );
 }

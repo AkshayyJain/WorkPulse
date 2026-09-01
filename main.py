@@ -1,29 +1,31 @@
 """
 WorkPulse - Enterprise FastAPI Application
-Production FastAPI REST API for deployment on Render / Cloud Run / VPS
-Full implementation of all Employee & Manager endpoints, RBAC, MongoDB integration with SQLite/Document store fallback, and Gemini AI Synthesis.
+Production FastAPI REST API with complete Entity-Service Architecture, MongoDB Atlas support, JWT Authentication, and Gemini AI Executive Synthesis.
 """
 
 import os
 import sys
 import json
 import time
-import hmac
 import hashlib
 from datetime import datetime, timedelta, date
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 
-from fastapi import FastAPI, Depends, HTTPException, status, Query, Header, Request
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, Header, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from jose import JWTError, jwt
-import urllib.request
-import urllib.error
+
+# Optional MongoDB support via PyMongo
+try:
+    from pymongo import MongoClient, ASCENDING, DESCENDING
+    from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+    PYMONGO_AVAILABLE = True
+except ImportError:
+    PYMONGO_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
-# Configuration & Secrets
+# Configuration & Environment
 # ---------------------------------------------------------------------------
 PORT = int(os.environ.get("PORT", 3000))
 JWT_SECRET = os.environ.get("JWT_SECRET", "workpulse-enterprise-secret-key-2026-production")
@@ -32,27 +34,10 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("JWT_EXPIRE_MINUTES", "1440"))
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
 MONGODB_URI = os.environ.get("MONGODB_URI", "")
+DATABASE_NAME = os.environ.get("DATABASE_NAME", "workpulse_db")
 
 # ---------------------------------------------------------------------------
-# FastAPI App Initialization
-# ---------------------------------------------------------------------------
-app = FastAPI(
-    title="WorkPulse Enterprise API",
-    description="REST API for Employee Work Tracking, 4-Question Reporting, and Executive AI Synthesis",
-    version="1.0.0"
-)
-
-# Enable CORS for all frontend origins (Vercel, Localhost, AI Studio, etc.)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ---------------------------------------------------------------------------
-# Helper: Date Calculations
+# Date Helpers
 # ---------------------------------------------------------------------------
 def get_reporting_week(target_date: Optional[date] = None) -> Dict[str, str]:
     if target_date is None:
@@ -71,20 +56,206 @@ def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 # ---------------------------------------------------------------------------
-# In-Memory / Relational Store (Thread-safe & Persistent)
+# 1. ENTITY & PYDANTIC MODELS LAYER
 # ---------------------------------------------------------------------------
-class DataStore:
+class UserRole(str):
+    EMPLOYEE = "EMPLOYEE"
+    MANAGER = "MANAGER"
+
+class UserEntity(BaseModel):
+    id: str
+    email: str
+    password: str  # Hashed
+    name: str
+    role: str
+    department: str
+    title: str
+    managerId: Optional[str] = None
+    managerName: Optional[str] = None
+    createdAt: str
+
+class UserPublic(BaseModel):
+    id: str
+    email: str
+    name: str
+    role: str
+    department: str
+    title: str
+    managerId: Optional[str] = None
+    managerName: Optional[str] = None
+
+class QuestionEntity(BaseModel):
+    id: str
+    text: str
+    category: str
+    required: bool = True
+    order: int = 1
+    isActive: bool = True
+    createdAt: Optional[str] = None
+
+class WorkUpdateEntity(BaseModel):
+    id: str
+    employeeId: str
+    workDate: str
+    hoursSpent: float
+    projectTag: str
+    description: str
+    createdAt: str
+    updatedAt: str
+
+class WeeklyReportAnswers(BaseModel):
+    accomplishments: Optional[str] = ""
+    inProgress: Optional[str] = ""
+    blockers: Optional[str] = ""
+    nextWeekPriorities: Optional[str] = ""
+
+class AISummaryEntity(BaseModel):
+    executiveSummary: str
+    keyAccomplishments: List[str] = []
+    currentWork: List[str] = []
+    blockers: List[str] = []
+    nextWeekPriorities: List[str] = []
+    generatedAt: str
+    model: str
+
+class WeeklyReportEntity(BaseModel):
+    id: str
+    employeeId: str
+    employeeName: str
+    employeeEmail: str
+    managerId: Optional[str] = None
+    weekStart: str
+    weekEnd: str
+    status: str = "DRAFT"  # DRAFT, SUBMITTED
+    reviewStatus: Optional[str] = "PENDING"  # PENDING, APPROVED, NEEDS_REVISION
+    managerFeedback: Optional[str] = ""
+    answers: Dict[str, Any] = {}
+    aiSummary: Optional[Dict[str, Any]] = None
+    aiStatus: str = "NOT_STARTED"  # NOT_STARTED, PROCESSING, COMPLETED, FAILED
+    submittedAt: Optional[str] = None
+    reviewedAt: Optional[str] = None
+    createdAt: str
+    updatedAt: str
+
+class AuditLogEntity(BaseModel):
+    id: str
+    userId: str
+    userEmail: str
+    action: str
+    targetType: str
+    targetId: str
+    details: str
+    timestamp: str
+
+# Request Payloads
+class LoginPayload(BaseModel):
+    email: str
+    password: str
+
+class WorkUpdateCreatePayload(BaseModel):
+    workDate: str
+    hoursSpent: float = Field(gt=0, le=24)
+    projectTag: Optional[str] = "General"
+    description: str
+
+class WorkUpdateUpdatePayload(BaseModel):
+    workDate: Optional[str] = None
+    hoursSpent: Optional[float] = None
+    projectTag: Optional[str] = None
+    description: Optional[str] = None
+
+class DraftSavePayload(BaseModel):
+    reportId: Optional[str] = None
+    weekStart: Optional[str] = None
+    weekEnd: Optional[str] = None
+    answers: Optional[Dict[str, Any]] = None
+
+class SubmitPayload(BaseModel):
+    answers: Optional[Dict[str, Any]] = None
+
+class ReviewPayload(BaseModel):
+    status: str = Field(pattern="^(APPROVED|NEEDS_REVISION|PENDING)$")
+    managerFeedback: Optional[str] = ""
+
+class QuestionCreatePayload(BaseModel):
+    text: str
+    category: Optional[str] = "General"
+    required: Optional[bool] = True
+    order: Optional[int] = 1
+
+# ---------------------------------------------------------------------------
+# 2. DATABASE & REPOSITORY LAYER (MongoDB + High-Performance Document Store)
+# ---------------------------------------------------------------------------
+class DatabaseManager:
     def __init__(self):
+        self.use_mongodb = False
+        self.mongo_client: Optional[Any] = None
+        self.mongo_db: Optional[Any] = None
+        self.local_file = os.path.join(os.getcwd(), "data", "db.json")
+        os.makedirs(os.path.dirname(self.local_file), exist_ok=True)
+        
+        # Local document collections
         self.users: List[Dict[str, Any]] = []
+        self.questions: List[Dict[str, Any]] = []
         self.work_updates: List[Dict[str, Any]] = []
         self.weekly_reports: List[Dict[str, Any]] = []
-        self.questions: List[Dict[str, Any]] = []
         self.audit_logs: List[Dict[str, Any]] = []
-        self.seed_initial_data()
+        
+        self.init_database()
 
-    def seed_initial_data(self):
+    def init_database(self):
+        # Attempt MongoDB / MongoDB Atlas connection if URI is present
+        if MONGODB_URI and PYMONGO_AVAILABLE:
+            try:
+                print(f"[DatabaseManager] Connecting to MongoDB Atlas: {MONGODB_URI.split('@')[-1] if '@' in MONGODB_URI else 'MongoDB'}")
+                self.mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=4000)
+                # Ping
+                self.mongo_client.admin.command('ping')
+                self.mongo_db = self.mongo_client[DATABASE_NAME]
+                self.use_mongodb = True
+                print(f"[DatabaseManager] Successfully connected to MongoDB Database: '{DATABASE_NAME}'")
+                self.ensure_mongo_indexes()
+                self.ensure_mongo_seed_data()
+                return
+            except Exception as err:
+                print(f"[DatabaseManager] MongoDB Atlas connection error ({err}). Falling back to persistent Document store.")
+                self.use_mongodb = False
+
+        # Fallback to local persistent JSON document store
+        self.load_local_store()
+
+    def ensure_mongo_indexes(self):
+        if not self.use_mongodb:
+            return
+        try:
+            self.mongo_db.users.create_index("email", unique=True)
+            self.mongo_db.work_updates.create_index([("employeeId", ASCENDING), ("workDate", DESCENDING)])
+            self.mongo_db.weekly_reports.create_index([("employeeId", ASCENDING), ("weekStart", DESCENDING)])
+            self.mongo_db.weekly_reports.create_index("managerId")
+            self.mongo_db.audit_logs.create_index("timestamp", expireAfterSeconds=60*60*24*90) # 90 days
+        except Exception as e:
+            print(f"[DatabaseManager] Index creation notice: {e}")
+
+    def ensure_mongo_seed_data(self):
+        if not self.use_mongodb:
+            return
+        try:
+            if self.mongo_db.users.count_documents({}) == 0:
+                print("[DatabaseManager] MongoDB is empty. Seeding initial collections...")
+                seed_data = self.get_seed_records()
+                self.mongo_db.users.insert_many(seed_data["users"])
+                self.mongo_db.questions.insert_many(seed_data["questions"])
+                self.mongo_db.work_updates.insert_many(seed_data["work_updates"])
+                self.mongo_db.weekly_reports.insert_many(seed_data["weekly_reports"])
+                self.mongo_db.audit_logs.insert_many(seed_data["audit_logs"])
+        except Exception as e:
+            print(f"[DatabaseManager] Seed error on MongoDB: {e}")
+
+    def get_seed_records(self) -> Dict[str, List[Dict[str, Any]]]:
         now = get_now_iso()
-        self.users = [
+        curr_week = get_reporting_week()
+        
+        users = [
             {
                 "id": "mgr-1",
                 "email": "manager1@example.com",
@@ -140,7 +311,7 @@ class DataStore:
                 "name": "Liam Wilson",
                 "role": "EMPLOYEE",
                 "department": "Engineering",
-                "title": "Backend / DevOps Engineer",
+                "title": "DevOps & Cloud Engineer",
                 "managerId": "mgr-1",
                 "managerName": "Sarah Connor",
                 "createdAt": now
@@ -152,7 +323,7 @@ class DataStore:
                 "name": "Jordan Taylor",
                 "role": "EMPLOYEE",
                 "department": "Product",
-                "title": "Senior Product Designer",
+                "title": "Product UX Designer",
                 "managerId": "mgr-2",
                 "managerName": "David Miller",
                 "createdAt": now
@@ -161,27 +332,24 @@ class DataStore:
                 "id": "emp-5",
                 "email": "employee5@example.com",
                 "password": hash_password("Employee@123"),
-                "name": "Chloe Zhang",
+                "name": "Chloe Vance",
                 "role": "EMPLOYEE",
                 "department": "Product",
-                "title": "Associate Product Manager",
+                "title": "QA Automation Specialist",
                 "managerId": "mgr-2",
                 "managerName": "David Miller",
                 "createdAt": now
             },
         ]
 
-        self.questions = [
+        questions = [
             {"id": "q-1", "text": "What were your key accomplishments and deliverables this week?", "category": "Accomplishments", "required": True, "order": 1, "isActive": True},
             {"id": "q-2", "text": "What tasks, features, or initiatives are currently in progress?", "category": "In Progress", "required": True, "order": 2, "isActive": True},
             {"id": "q-3", "text": "Did you encounter any blockers, risks, or dependency bottlenecks?", "category": "Blockers", "required": True, "order": 3, "isActive": True},
             {"id": "q-4", "text": "What are your top priorities and commitments planned for next week?", "category": "Priorities", "required": True, "order": 4, "isActive": True},
         ]
 
-        # Seed sample work updates for employee 1
-        curr_week = get_reporting_week()
-        d0 = date.today()
-        self.work_updates = [
+        work_updates = [
             {
                 "id": "upd-seed-1",
                 "employeeId": "emp-1",
@@ -201,11 +369,55 @@ class DataStore:
                 "description": "Engineered fallback executive synthesis pipeline with Gemini 3.7 Flash support.",
                 "createdAt": now,
                 "updatedAt": now
+            },
+            {
+                "id": "upd-seed-3",
+                "employeeId": "emp-2",
+                "workDate": curr_week["weekStart"],
+                "hoursSpent": 7.0,
+                "projectTag": "UI Components",
+                "description": "Implemented accessible WCAG theme switcher and responsive daily work updates table.",
+                "createdAt": now,
+                "updatedAt": now
             }
         ]
 
-        self.weekly_reports = []
-        self.audit_logs = [
+        weekly_reports = [
+            {
+                "id": "rep-seed-1",
+                "employeeId": "emp-2",
+                "employeeName": "Maya Chen",
+                "employeeEmail": "employee2@example.com",
+                "managerId": "mgr-1",
+                "weekStart": curr_week["weekStart"],
+                "weekEnd": curr_week["weekEnd"],
+                "status": "SUBMITTED",
+                "reviewStatus": "APPROVED",
+                "managerFeedback": "Great job on the theme and layout refactoring!",
+                "answers": {
+                    "accomplishments": "Completed dark/light theme switching and streamlined report questionnaire.",
+                    "inProgress": "Optimizing PDF export pagination and font styles.",
+                    "blockers": "None this week.",
+                    "nextWeekPriorities": "Build manager batch report approval workflow."
+                },
+                "aiSummary": {
+                    "executiveSummary": "Maya delivered high-quality UI theming components and refined the questionnaire flow with zero blockers reported.",
+                    "keyAccomplishments": ["Shipped theme switching", "Streamlined 4-question submission UX"],
+                    "currentWork": ["PDF generator pagination optimization"],
+                    "blockers": ["No active blockers reported"],
+                    "nextWeekPriorities": ["Manager batch review workflow"],
+                    "generatedAt": now,
+                    "model": "gemini-3.7-flash"
+                },
+                "aiStatus": "COMPLETED",
+                "submittedAt": now,
+                "reviewedAt": now,
+                "createdAt": now,
+                "updatedAt": now
+            }
+        ]
+
+        audit_logs = [
             {
                 "id": "aud-init",
                 "userId": "system",
@@ -218,63 +430,371 @@ class DataStore:
             }
         ]
 
-    def log_audit(self, user_id: str, email: str, action: str, target_type: str, target_id: str, details: str):
-        self.audit_logs.insert(0, {
+        return {
+            "users": users,
+            "questions": questions,
+            "work_updates": work_updates,
+            "weekly_reports": weekly_reports,
+            "audit_logs": audit_logs
+        }
+
+    def load_local_store(self):
+        if os.path.exists(self.local_file):
+            try:
+                with open(self.local_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.users = data.get("users", [])
+                    self.questions = data.get("questions", [])
+                    self.work_updates = data.get("work_updates", data.get("workUpdates", []))
+                    self.weekly_reports = data.get("weekly_reports", data.get("weeklyReports", []))
+                    self.audit_logs = data.get("audit_logs", data.get("auditLogs", []))
+                    print(f"[DatabaseManager] Loaded local store: {len(self.users)} users, {len(self.work_updates)} updates.")
+                    return
+            except Exception as e:
+                print(f"[DatabaseManager] Failed to read local store ({e}). Rebuilding seeds.")
+        
+        # Initialize defaults
+        seed = self.get_seed_records()
+        self.users = seed["users"]
+        self.questions = seed["questions"]
+        self.work_updates = seed["work_updates"]
+        self.weekly_reports = seed["weekly_reports"]
+        self.audit_logs = seed["audit_logs"]
+        self.save_local_store()
+
+    def save_local_store(self):
+        if self.use_mongodb:
+            return
+        try:
+            with open(self.local_file, "w", encoding="utf-8") as f:
+                json.dump({
+                    "users": self.users,
+                    "questions": self.questions,
+                    "work_updates": self.work_updates,
+                    "weekly_reports": self.weekly_reports,
+                    "audit_logs": self.audit_logs
+                }, f, indent=2)
+        except Exception as e:
+            print(f"[DatabaseManager] Error saving local store: {e}")
+
+    def get_status(self) -> Dict[str, Any]:
+        if self.use_mongodb:
+            try:
+                t0 = time.time()
+                self.mongo_client.admin.command('ping')
+                latency = round((time.time() - t0) * 1000, 2)
+                return {
+                    "databaseType": "MongoDB Atlas" if "mongodb+srv://" in MONGODB_URI else "MongoDB",
+                    "connected": True,
+                    "databaseName": DATABASE_NAME,
+                    "latencyMs": latency,
+                    "collections": {
+                        "users": self.mongo_db.users.count_documents({}),
+                        "work_updates": self.mongo_db.work_updates.count_documents({}),
+                        "weekly_reports": self.mongo_db.weekly_reports.count_documents({}),
+                        "questions": self.mongo_db.questions.count_documents({}),
+                        "audit_logs": self.mongo_db.audit_logs.count_documents({})
+                    },
+                    "uriConfigured": True
+                }
+            except Exception as e:
+                return {
+                    "databaseType": "MongoDB (Offline/Fallback)",
+                    "connected": False,
+                    "error": str(e),
+                    "databaseName": DATABASE_NAME,
+                    "uriConfigured": True
+                }
+        else:
+            return {
+                "databaseType": "Embedded Persistent Document Store (JSON Engine)",
+                "connected": True,
+                "databaseName": "local_data_store",
+                "latencyMs": 0.5,
+                "collections": {
+                    "users": len(self.users),
+                    "work_updates": len(self.work_updates),
+                    "weekly_reports": len(self.weekly_reports),
+                    "questions": len(self.questions),
+                    "audit_logs": len(self.audit_logs)
+                },
+                "uriConfigured": bool(MONGODB_URI)
+            }
+
+db_manager = DatabaseManager()
+
+# ---------------------------------------------------------------------------
+# 3. REPOSITORY LAYER
+# ---------------------------------------------------------------------------
+class UserRepository:
+    @staticmethod
+    def find_by_email(email: str) -> Optional[Dict[str, Any]]:
+        email_clean = email.strip().lower()
+        if db_manager.use_mongodb:
+            doc = db_manager.mongo_db.users.find_one({"email": {"$regex": f"^{email_clean}$", "$options": "i"}})
+            if doc:
+                doc.pop("_id", None)
+            return doc
+        return next((u for u in db_manager.users if u["email"].lower() == email_clean), None)
+
+    @staticmethod
+    def find_by_id(user_id: str) -> Optional[Dict[str, Any]]:
+        if db_manager.use_mongodb:
+            doc = db_manager.mongo_db.users.find_one({"id": user_id})
+            if doc:
+                doc.pop("_id", None)
+            return doc
+        return next((u for u in db_manager.users if u["id"] == user_id), None)
+
+    @staticmethod
+    def find_by_manager(manager_id: str) -> List[Dict[str, Any]]:
+        if db_manager.use_mongodb:
+            docs = list(db_manager.mongo_db.users.find({"managerId": manager_id, "role": "EMPLOYEE"}))
+            for d in docs:
+                d.pop("_id", None)
+            return docs
+        return [u for u in db_manager.users if u.get("managerId") == manager_id and u.get("role") == "EMPLOYEE"]
+
+class WorkUpdateRepository:
+    @staticmethod
+    def find(employee_id: Optional[str] = None, week_start: Optional[str] = None, week_end: Optional[str] = None) -> List[Dict[str, Any]]:
+        if db_manager.use_mongodb:
+            q: Dict[str, Any] = {}
+            if employee_id:
+                q["employeeId"] = employee_id
+            if week_start and week_end:
+                q["workDate"] = {"$gte": week_start, "$lte": week_end}
+            elif week_start:
+                q["workDate"] = {"$gte": week_start}
+            docs = list(db_manager.mongo_db.work_updates.find(q).sort("workDate", DESCENDING))
+            for d in docs:
+                d.pop("_id", None)
+            return docs
+        
+        res = db_manager.work_updates
+        if employee_id:
+            res = [w for w in res if w.get("employeeId") == employee_id]
+        if week_start and week_end:
+            res = [w for w in res if week_start <= w.get("workDate", "") <= week_end]
+        elif week_start:
+            res = [w for w in res if w.get("workDate", "") >= week_start]
+        return sorted(res, key=lambda x: x.get("workDate", ""), reverse=True)
+
+    @staticmethod
+    def find_by_id(update_id: str) -> Optional[Dict[str, Any]]:
+        if db_manager.use_mongodb:
+            doc = db_manager.mongo_db.work_updates.find_one({"id": update_id})
+            if doc:
+                doc.pop("_id", None)
+            return doc
+        return next((w for w in db_manager.work_updates if w["id"] == update_id), None)
+
+    @staticmethod
+    def create(data: Dict[str, Any]) -> Dict[str, Any]:
+        if db_manager.use_mongodb:
+            db_manager.mongo_db.work_updates.insert_one(data.copy())
+            data.pop("_id", None)
+            return data
+        db_manager.work_updates.append(data)
+        db_manager.save_local_store()
+        return data
+
+    @staticmethod
+    def update(update_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if db_manager.use_mongodb:
+            db_manager.mongo_db.work_updates.update_one({"id": update_id}, {"$set": updates})
+            return WorkUpdateRepository.find_by_id(update_id)
+        for i, item in enumerate(db_manager.work_updates):
+            if item["id"] == update_id:
+                db_manager.work_updates[i].update(updates)
+                db_manager.save_local_store()
+                return db_manager.work_updates[i]
+        return None
+
+    @staticmethod
+    def delete(update_id: str) -> bool:
+        if db_manager.use_mongodb:
+            res = db_manager.mongo_db.work_updates.delete_one({"id": update_id})
+            return res.deleted_count > 0
+        before = len(db_manager.work_updates)
+        db_manager.work_updates = [w for w in db_manager.work_updates if w["id"] != update_id]
+        deleted = len(db_manager.work_updates) < before
+        if deleted:
+            db_manager.save_local_store()
+        return deleted
+
+class WeeklyReportRepository:
+    @staticmethod
+    def find_by_id(report_id: str) -> Optional[Dict[str, Any]]:
+        if db_manager.use_mongodb:
+            doc = db_manager.mongo_db.weekly_reports.find_one({"id": report_id})
+            if doc:
+                doc.pop("_id", None)
+            return doc
+        return next((r for r in db_manager.weekly_reports if r["id"] == report_id), None)
+
+    @staticmethod
+    def find_by_employee_and_week(employee_id: str, week_start: str) -> Optional[Dict[str, Any]]:
+        if db_manager.use_mongodb:
+            doc = db_manager.mongo_db.weekly_reports.find_one({"employeeId": employee_id, "weekStart": week_start})
+            if doc:
+                doc.pop("_id", None)
+            return doc
+        return next((r for r in db_manager.weekly_reports if r.get("employeeId") == employee_id and r.get("weekStart") == week_start), None)
+
+    @staticmethod
+    def find_by_employee(employee_id: str) -> List[Dict[str, Any]]:
+        if db_manager.use_mongodb:
+            docs = list(db_manager.mongo_db.weekly_reports.find({"employeeId": employee_id}).sort("weekStart", DESCENDING))
+            for d in docs:
+                d.pop("_id", None)
+            return docs
+        return sorted([r for r in db_manager.weekly_reports if r.get("employeeId") == employee_id], key=lambda x: x.get("weekStart", ""), reverse=True)
+
+    @staticmethod
+    def find_by_manager(manager_id: str) -> List[Dict[str, Any]]:
+        if db_manager.use_mongodb:
+            docs = list(db_manager.mongo_db.weekly_reports.find({"managerId": manager_id}).sort("weekStart", DESCENDING))
+            for d in docs:
+                d.pop("_id", None)
+            return docs
+        return sorted([r for r in db_manager.weekly_reports if r.get("managerId") == manager_id], key=lambda x: x.get("weekStart", ""), reverse=True)
+
+    @staticmethod
+    def save(report: Dict[str, Any]) -> Dict[str, Any]:
+        report_id = report["id"]
+        if db_manager.use_mongodb:
+            db_manager.mongo_db.weekly_reports.update_one({"id": report_id}, {"$set": report}, upsert=True)
+            return WeeklyReportRepository.find_by_id(report_id) or report
+        for i, r in enumerate(db_manager.weekly_reports):
+            if r["id"] == report_id:
+                db_manager.weekly_reports[i] = report
+                db_manager.save_local_store()
+                return report
+        db_manager.weekly_reports.append(report)
+        db_manager.save_local_store()
+        return report
+
+class QuestionRepository:
+    @staticmethod
+    def get_all(active_only: bool = True) -> List[Dict[str, Any]]:
+        if db_manager.use_mongodb:
+            q = {"isActive": True} if active_only else {}
+            docs = list(db_manager.mongo_db.questions.find(q).sort("order", ASCENDING))
+            for d in docs:
+                d.pop("_id", None)
+            return docs
+        items = [q for q in db_manager.questions if (not active_only or q.get("isActive", True))]
+        return sorted(items, key=lambda x: x.get("order", 1))
+
+    @staticmethod
+    def create(data: Dict[str, Any]) -> Dict[str, Any]:
+        if db_manager.use_mongodb:
+            db_manager.mongo_db.questions.insert_one(data.copy())
+            data.pop("_id", None)
+            return data
+        db_manager.questions.append(data)
+        db_manager.save_local_store()
+        return data
+
+    @staticmethod
+    def update(q_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if db_manager.use_mongodb:
+            db_manager.mongo_db.questions.update_one({"id": q_id}, {"$set": updates})
+            doc = db_manager.mongo_db.questions.find_one({"id": q_id})
+            if doc:
+                doc.pop("_id", None)
+            return doc
+        for i, q in enumerate(db_manager.questions):
+            if q["id"] == q_id:
+                db_manager.questions[i].update(updates)
+                db_manager.save_local_store()
+                return db_manager.questions[i]
+        return None
+
+    @staticmethod
+    def delete(q_id: str) -> bool:
+        return QuestionRepository.update(q_id, {"isActive": False}) is not None
+
+class AuditLogRepository:
+    @staticmethod
+    def log(user_id: str, user_email: str, action: str, target_type: str, target_id: str, details: str):
+        record = {
             "id": f"aud-{int(time.time()*1000)}",
             "userId": user_id,
-            "userEmail": email,
+            "userEmail": user_email,
             "action": action,
             "targetType": target_type,
             "targetId": target_id,
             "details": details,
             "timestamp": get_now_iso()
-        })
-
-db = DataStore()
-
-# ---------------------------------------------------------------------------
-# Auth Utilities & Dependency
-# ---------------------------------------------------------------------------
-def create_access_token(data: dict) -> str:
-    to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
-
-async def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid authentication token. Please log in.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    token = authorization.split(" ")[1]
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
-        return payload
-    except JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Session has expired. Please log in again.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        }
+        if db_manager.use_mongodb:
+            try:
+                db_manager.mongo_db.audit_logs.insert_one(record)
+            except Exception:
+                pass
+        else:
+            db_manager.audit_logs.insert(0, record)
+            db_manager.save_local_store()
 
 # ---------------------------------------------------------------------------
-# Gemini AI Synthesis
+# 4. SERVICE LAYER (Business Logic)
 # ---------------------------------------------------------------------------
-def synthesize_executive_summary(employee_name: str, reporting_period: str, work_updates: list, answers: dict) -> dict:
-    formatted_logs = "\n".join([
-        f"{idx+1}. [{u.get('workDate')}] ({u.get('hoursSpent',0)}h | {u.get('projectTag','General')}): {u.get('description','')}"
-        for idx, u in enumerate(work_updates)
-    ]) if work_updates else "No daily logs recorded."
+class AuthService:
+    @staticmethod
+    def create_token(user_payload: Dict[str, Any]) -> str:
+        payload = user_payload.copy()
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        payload.update({"exp": expire})
+        return jwt.encode(payload, JWT_SECRET, algorithm=ALGORITHM)
 
-    prompt = f"""You are an executive employee reporting assistant. Summarize the provided weekly work report using ONLY the information supplied.
+    @staticmethod
+    def verify_token(token: str) -> Dict[str, Any]:
+        try:
+            return jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+        except JWTError:
+            raise HTTPException(status_code=401, detail="Invalid or expired session token.")
+
+    @staticmethod
+    def authenticate(email: str, password: str) -> Dict[str, Any]:
+        user = UserRepository.find_by_email(email)
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+        
+        pw_hash = hash_password(password)
+        if user["password"] != pw_hash:
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+        user_data = {
+            "id": user["id"],
+            "email": user["email"],
+            "name": user["name"],
+            "role": user["role"],
+            "department": user["department"],
+            "title": user["title"],
+            "managerId": user.get("managerId"),
+            "managerName": user.get("managerName")
+        }
+        token = AuthService.create_token(user_data)
+        AuditLogRepository.log(user["id"], user["email"], "USER_LOGIN", "USER", user["id"], f"{user['name']} logged in.")
+        return {"token": token, "user": user_data}
+
+class AISummaryService:
+    @staticmethod
+    def synthesize(employee_name: str, reporting_period: str, work_updates: List[Dict[str, Any]], answers: Dict[str, Any]) -> Dict[str, Any]:
+        logs_formatted = "\n".join([
+            f"{i+1}. [{u.get('workDate')}] ({u.get('hoursSpent',0)}h | {u.get('projectTag','General')}): {u.get('description','')}"
+            for i, u in enumerate(work_updates)
+        ]) if work_updates else "No daily logs recorded."
+
+        prompt = f"""You are an executive employee reporting assistant. Summarize the provided weekly work report using ONLY the provided facts.
 
 EMPLOYEE: {employee_name}
 REPORTING PERIOD: {reporting_period}
 
 DAILY WORK LOGS:
-{formatted_logs}
+{logs_formatted}
 
 WEEKLY REPORT RESPONSES:
 1. Accomplishments: {answers.get('accomplishments', 'None stated')}
@@ -282,588 +802,458 @@ WEEKLY REPORT RESPONSES:
 3. Blockers: {answers.get('blockers', 'None stated')}
 4. Next Week Priorities: {answers.get('nextWeekPriorities', 'None stated')}
 
-Output strict JSON:
+Output valid JSON matching this schema:
 {{
-  "executiveSummary": "Concise 2-3 sentence overview of work completed and trajectory...",
-  "keyAccomplishments": ["Accomplishment 1", "Accomplishment 2"],
+  "executiveSummary": "2-3 concise sentences summarizing deliverables and trajectory...",
+  "keyAccomplishments": ["Key deliverable 1", "Key deliverable 2"],
   "currentWork": ["Work item 1", "Work item 2"],
   "blockers": ["Blocker item or 'No active blockers reported'"],
   "nextWeekPriorities": ["Priority 1", "Priority 2"]
 }}"""
 
-    if GEMINI_API_KEY:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-            body = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"responseMimeType": "application/json"}
+        if GEMINI_API_KEY:
+            try:
+                import urllib.request
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+                body = {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"responseMimeType": "application/json"}
+                }
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(body).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}
+                )
+                with urllib.request.urlopen(req, timeout=14) as resp:
+                    raw_data = json.loads(resp.read().decode("utf-8"))
+                    text = raw_data['candidates'][0]['content']['parts'][0]['text']
+                    parsed = json.loads(text.strip().replace('```json', '').replace('```', ''))
+                    parsed["generatedAt"] = get_now_iso()
+                    parsed["model"] = GEMINI_MODEL
+                    return parsed
+            except Exception as e:
+                print(f"[AISummaryService] Gemini API notice: {e}")
+
+        # Deterministic High-Precision Fallback
+        total_hours = sum(u.get('hoursSpent', 0) for u in work_updates)
+        acc = [a.strip() for a in (answers.get('accomplishments') or '').split('\n') if a.strip()]
+        prog = [p.strip() for p in (answers.get('inProgress') or '').split('\n') if p.strip()]
+        block = [b.strip() for b in (answers.get('blockers') or '').split('\n') if b.strip()]
+        prio = [pr.strip() for pr in (answers.get('nextWeekPriorities') or '').split('\n') if pr.strip()]
+
+        return {
+            "executiveSummary": f"{employee_name} logged {len(work_updates)} updates totaling {total_hours}h during the {reporting_period} cycle, maintaining execution across primary project streams.",
+            "keyAccomplishments": acc[:4] or ["Completed assigned development tasks and milestones."],
+            "currentWork": prog[:4] or ["Core project deliverables in active progress."],
+            "blockers": block[:3] or ["No active blockers reported."],
+            "nextWeekPriorities": prio[:4] or ["Proceed with scheduled roadmap commitments."],
+            "generatedAt": get_now_iso(),
+            "model": "WorkPulse Executive Synthesis Engine"
+        }
+
+class WeeklyReportService:
+    @staticmethod
+    def get_or_create_current_report(user: Dict[str, Any]) -> Dict[str, Any]:
+        curr_week = get_reporting_week()
+        rep = WeeklyReportRepository.find_by_employee_and_week(user["id"], curr_week["weekStart"])
+        if not rep:
+            rep = {
+                "id": f"rep-{int(time.time()*1000)}",
+                "employeeId": user["id"],
+                "employeeName": user["name"],
+                "employeeEmail": user["email"],
+                "managerId": user.get("managerId"),
+                "weekStart": curr_week["weekStart"],
+                "weekEnd": curr_week["weekEnd"],
+                "status": "DRAFT",
+                "reviewStatus": "PENDING",
+                "managerFeedback": "",
+                "answers": {"accomplishments": "", "inProgress": "", "blockers": "", "nextWeekPriorities": ""},
+                "aiSummary": None,
+                "aiStatus": "NOT_STARTED",
+                "createdAt": get_now_iso(),
+                "updatedAt": get_now_iso()
             }
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(body).encode("utf-8"),
-                headers={"Content-Type": "application/json"}
-            )
-            with urllib.request.urlopen(req, timeout=12) as res:
-                data = json.loads(res.read().decode("utf-8"))
-                text_content = data['candidates'][0]['content']['parts'][0]['text']
-                parsed = json.loads(text_content.strip().replace('```json', '').replace('```', ''))
-                parsed["generatedAt"] = get_now_iso()
-                parsed["model"] = GEMINI_MODEL
-                return parsed
-        except Exception as e:
-            print(f"[AI Synthesis Notice] Gemini API call fallback: {e}")
+            WeeklyReportRepository.save(rep)
+        
+        updates = WorkUpdateRepository.find(user["id"], curr_week["weekStart"], curr_week["weekEnd"])
+        return {"report": rep, "workUpdates": updates}
 
-    # Deterministic High-Precision Fallback
-    total_hours = sum(u.get('hoursSpent', 0) for u in work_updates)
-    acc = [a.strip() for a in (answers.get('accomplishments') or '').split('\n') if a.strip()]
-    prog = [p.strip() for p in (answers.get('inProgress') or '').split('\n') if p.strip()]
-    block = [b.strip() for b in (answers.get('blockers') or '').split('\n') if b.strip()]
-    prio = [pr.strip() for pr in (answers.get('nextWeekPriorities') or '').split('\n') if pr.strip()]
+    @staticmethod
+    def submit_report(report_id: str, user: Dict[str, Any], answers: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        report = WeeklyReportRepository.find_by_id(report_id)
+        if not report:
+            raise HTTPException(status_code=404, detail="Weekly report not found.")
+        if report["employeeId"] != user["id"]:
+            raise HTTPException(status_code=403, detail="Unauthorized to submit this report.")
+        
+        if answers:
+            report["answers"].update(answers)
 
-    return {
-        "executiveSummary": f"{employee_name} logged {len(work_updates)} updates totaling {total_hours} hours during the {reporting_period} cycle, maintaining forward momentum across primary project objectives.",
-        "keyAccomplishments": acc[:4] or ["Completed assigned sprint items and deliverables."],
-        "currentWork": prog[:4] or ["Core project work in active development."],
-        "blockers": block[:3] or ["No active blockers reported."],
-        "nextWeekPriorities": prio[:4] or ["Execute scheduled roadmap priorities."],
-        "generatedAt": get_now_iso(),
-        "model": "WorkPulse Executive Synthesis Engine"
-    }
+        report["status"] = "SUBMITTED"
+        report["submittedAt"] = get_now_iso()
+        report["updatedAt"] = get_now_iso()
 
-# ---------------------------------------------------------------------------
-# Pydantic Request Models
-# ---------------------------------------------------------------------------
-class LoginPayload(BaseModel):
-    email: str
-    password: str
+        # Generate Executive AI Summary
+        updates = WorkUpdateRepository.find(report["employeeId"], report["weekStart"], report["weekEnd"])
+        summary = AISummaryService.synthesize(
+            report["employeeName"],
+            f"{report['weekStart']} to {report['weekEnd']}",
+            updates,
+            report["answers"]
+        )
+        report["aiSummary"] = summary
+        report["aiStatus"] = "COMPLETED"
 
-class WorkUpdateCreatePayload(BaseModel):
-    workDate: str
-    hoursSpent: float = Field(gt=0, le=24)
-    projectTag: Optional[str] = "General"
-    description: str
-
-class WorkUpdateUpdatePayload(BaseModel):
-    workDate: Optional[str] = None
-    hoursSpent: Optional[float] = None
-    projectTag: Optional[str] = None
-    description: Optional[str] = None
-
-class WeeklyReportAnswersPayload(BaseModel):
-    accomplishments: Optional[str] = ""
-    inProgress: Optional[str] = ""
-    blockers: Optional[str] = ""
-    nextWeekPriorities: Optional[str] = ""
-
-class DraftSavePayload(BaseModel):
-    reportId: Optional[str] = None
-    weekStart: Optional[str] = None
-    weekEnd: Optional[str] = None
-    answers: Optional[WeeklyReportAnswersPayload] = None
-
-class SubmitPayload(BaseModel):
-    answers: Optional[WeeklyReportAnswersPayload] = None
-
-class QuestionCreatePayload(BaseModel):
-    text: str
-    category: Optional[str] = "General"
-    required: Optional[bool] = True
-    order: Optional[int] = 1
+        WeeklyReportRepository.save(report)
+        AuditLogRepository.log(user["id"], user["email"], "REPORT_SUBMITTED", "REPORT", report_id, f"Report submitted for cycle {report['weekStart']}")
+        return {"report": report, "workUpdates": updates}
 
 # ---------------------------------------------------------------------------
-# API Endpoints
+# 5. AUTH DEPENDENCY
 # ---------------------------------------------------------------------------
+async def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing Bearer token in Authorization header.",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    token = authorization.split(" ")[1]
+    return AuthService.verify_token(token)
 
+def require_manager(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    if user.get("role") != "MANAGER":
+        raise HTTPException(status_code=403, detail="Manager role privileges required.")
+    return user
+
+# ---------------------------------------------------------------------------
+# 6. FASTAPI CONTROLLER & ROUTER LAYER
+# ---------------------------------------------------------------------------
+app = FastAPI(
+    title="WorkPulse Enterprise API",
+    description="REST API with Entity-Service Architecture, MongoDB Atlas support, JWT Auth, and Gemini AI Executive Summaries",
+    version="2.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Routers
+auth_router = APIRouter(prefix="/api/auth", tags=["Authentication"])
+questions_router = APIRouter(prefix="/api/questions", tags=["Questions"])
+work_updates_router = APIRouter(prefix="/api/work-updates", tags=["Work Updates"])
+reports_router = APIRouter(prefix="/api/reports", tags=["Weekly Reports"])
+manager_router = APIRouter(prefix="/api/manager", tags=["Manager Portal"])
+
+# --- System & DB Health ---
 @app.get("/")
-def root_status():
-    """Root status endpoint to verify backend is active on Render."""
+def api_root():
     return {
         "service": "WorkPulse Enterprise API Server",
         "status": "online",
         "framework": "FastAPI + Python 3",
         "docsUrl": "/docs",
+        "dbStatusUrl": "/api/db-status",
         "healthUrl": "/api/health",
         "timestamp": get_now_iso()
     }
 
 @app.get("/api/health")
 def api_health():
+    db_stat = db_manager.get_status()
     return {
         "status": "healthy",
-        "framework": "FastAPI + Python 3",
+        "service": "WorkPulse API Server",
+        "environment": os.environ.get("NODE_ENV", "development"),
+        "database": db_stat["databaseType"],
+        "databaseConnected": db_stat.get("connected", False),
         "aiConfigured": bool(GEMINI_API_KEY),
         "aiModel": GEMINI_MODEL,
         "timestamp": get_now_iso()
     }
 
-# --- AUTH ---
-@app.post("/api/auth/login")
-def api_login(payload: LoginPayload):
-    email = payload.email.strip().lower()
-    pw_hash = hash_password(payload.password)
-    user = next((u for u in db.users if u["email"].lower() == email and u["password"] == pw_hash), None)
-    
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid email or password credentials.")
+@app.get("/api/db-status")
+def api_db_status():
+    return db_manager.get_status()
 
-    token = create_access_token({
-        "id": user["id"],
-        "email": user["email"],
-        "name": user["name"],
-        "role": user["role"],
-        "department": user["department"],
-        "title": user["title"],
-        "managerId": user["managerId"],
-        "managerName": user["managerName"]
-    })
+# --- Auth Endpoints ---
+@auth_router.post("/login")
+def login(payload: LoginPayload):
+    return AuthService.authenticate(payload.email, payload.password)
 
-    db.log_audit(user["id"], user["email"], "USER_LOGIN", "USER", user["id"], f"{user['name']} logged in successfully")
-
-    return {
-        "token": token,
-        "user": {
-            "id": user["id"],
-            "email": user["email"],
-            "name": user["name"],
-            "role": user["role"],
-            "department": user["department"],
-            "title": user["title"],
-            "managerId": user["managerId"],
-            "managerName": user["managerName"]
-        }
-    }
-
-@app.get("/api/auth/me")
-def api_get_me(user: dict = Depends(get_current_user)):
+@auth_router.get("/me")
+def get_me(user: Dict[str, Any] = Depends(get_current_user)):
     return {"user": user}
 
-@app.post("/api/auth/reset-demo")
-def api_reset_demo(user: dict = Depends(get_current_user)):
-    db.seed_initial_data()
-    return {"message": "Demo data has been reset successfully."}
+@auth_router.post("/reset-demo")
+def reset_demo(user: Dict[str, Any] = Depends(get_current_user)):
+    db_manager.load_local_store()
+    return {"message": "Demo data restored successfully."}
 
-# --- QUESTIONS ---
-@app.get("/api/questions")
-def api_get_questions():
-    active_qs = [q for q in db.questions if q.get("isActive", True)]
-    active_qs.sort(key=lambda x: x.get("order", 1))
-    return {"questions": active_qs}
+# --- Questions Endpoints ---
+@questions_router.get("")
+def get_questions():
+    return {"questions": QuestionRepository.get_all(active_only=True)}
 
-@app.post("/api/questions")
-def api_create_question(payload: QuestionCreatePayload, user: dict = Depends(get_current_user)):
-    if user.get("role") != "MANAGER":
-        raise HTTPException(status_code=403, detail="Only managers can manage questions.")
+@questions_router.post("")
+def create_question(payload: QuestionCreatePayload, user: Dict[str, Any] = Depends(require_manager)):
     new_q = {
         "id": f"q-{int(time.time()*1000)}",
         "text": payload.text,
-        "category": payload.category,
-        "required": payload.required,
-        "order": payload.order,
-        "isActive": True
+        "category": payload.category or "General",
+        "required": payload.required if payload.required is not None else True,
+        "order": payload.order or 1,
+        "isActive": True,
+        "createdAt": get_now_iso()
     }
-    db.questions.append(new_q)
-    return {"question": new_q}
+    created = QuestionRepository.create(new_q)
+    return {"question": created}
 
-@app.put("/api/questions/{qid}")
-def api_update_question(qid: str, payload: QuestionCreatePayload, user: dict = Depends(get_current_user)):
-    if user.get("role") != "MANAGER":
-        raise HTTPException(status_code=403, detail="Only managers can manage questions.")
-    q = next((item for item in db.questions if item["id"] == qid), None)
-    if not q:
+@questions_router.put("/{q_id}")
+def update_question(q_id: str, payload: Dict[str, Any], user: Dict[str, Any] = Depends(require_manager)):
+    updated = QuestionRepository.update(q_id, payload)
+    if not updated:
         raise HTTPException(status_code=404, detail="Question not found.")
-    q["text"] = payload.text
-    q["category"] = payload.category
-    q["required"] = payload.required
-    q["order"] = payload.order
-    return {"question": q}
+    return {"question": updated}
 
-@app.delete("/api/questions/{qid}")
-def api_delete_question(qid: str, user: dict = Depends(get_current_user)):
-    if user.get("role") != "MANAGER":
-        raise HTTPException(status_code=403, detail="Only managers can delete questions.")
-    db.questions = [item for item in db.questions if item["id"] != qid]
-    return {"message": "Question deleted."}
+@questions_router.delete("/{q_id}")
+def delete_question(q_id: str, user: Dict[str, Any] = Depends(require_manager)):
+    success = QuestionRepository.delete(q_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Question not found.")
+    return {"message": "Question deactivated successfully."}
 
-# --- WORK UPDATES ---
-@app.get("/api/work-updates")
-def api_get_work_updates(
-    employeeId: Optional[str] = None,
-    weekStart: Optional[str] = None,
-    weekEnd: Optional[str] = None,
-    user: dict = Depends(get_current_user)
+# --- Work Updates Endpoints ---
+@work_updates_router.get("")
+def get_work_updates(
+    employeeId: Optional[str] = Query(None),
+    weekStart: Optional[str] = Query(None),
+    weekEnd: Optional[str] = Query(None),
+    user: Dict[str, Any] = Depends(get_current_user)
 ):
-    target_emp_id = user["id"]
-    if employeeId and employeeId != user["id"]:
-        if user.get("role") != "MANAGER":
-            raise HTTPException(status_code=403, detail="Employees cannot view other employees' work logs.")
-        # Verify manager relationship
-        managed_emp = next((u for u in db.users if u["id"] == employeeId and u["managerId"] == user["id"]), None)
-        if not managed_emp:
-            raise HTTPException(status_code=403, detail="Unauthorized access to unassigned employee logs.")
-        target_emp_id = employeeId
-
-    updates = [u for u in db.work_updates if u["employeeId"] == target_emp_id]
-    if weekStart:
-        updates = [u for u in updates if u["workDate"] >= weekStart]
-    if weekEnd:
-        updates = [u for u in updates if u["workDate"] <= weekEnd]
-
-    updates.sort(key=lambda x: x["workDate"], reverse=True)
+    target_emp_id = employeeId if (employeeId and user["role"] == "MANAGER") else user["id"]
+    updates = WorkUpdateRepository.find(target_emp_id, weekStart, weekEnd)
     return {"workUpdates": updates}
 
-@app.post("/api/work-updates")
-def api_create_work_update(payload: WorkUpdateCreatePayload, user: dict = Depends(get_current_user)):
-    if user.get("role") != "EMPLOYEE":
-        raise HTTPException(status_code=403, detail="Only employees can log work updates.")
-
-    # Check if report for that week is already submitted
-    parsed_date = datetime.strptime(payload.workDate, "%Y-%m-%d").date()
-    week_info = get_reporting_week(parsed_date)
-    existing_rep = next((r for r in db.weekly_reports if r["employeeId"] == user["id"] and r["weekStart"] == week_info["weekStart"]), None)
-
-    if existing_rep and existing_rep.get("status") == "SUBMITTED":
-        raise HTTPException(status_code=400, detail="Cannot log work updates for an already submitted and locked report.")
-
-    now = get_now_iso()
-    new_update = {
-        "id": f"upd-{int(time.time()*1000)}",
+@work_updates_router.post("")
+def create_work_update(payload: WorkUpdateCreatePayload, user: Dict[str, Any] = Depends(get_current_user)):
+    new_upd = {
+        "id": f"wu-{int(time.time()*1000)}",
         "employeeId": user["id"],
         "workDate": payload.workDate,
         "hoursSpent": payload.hoursSpent,
         "projectTag": payload.projectTag or "General",
-        "description": payload.description,
-        "createdAt": now,
-        "updatedAt": now
+        "description": payload.description.strip(),
+        "createdAt": get_now_iso(),
+        "updatedAt": get_now_iso()
     }
-    db.work_updates.insert(0, new_update)
-    db.log_audit(user["id"], user["email"], "WORK_UPDATE_CREATED", "WORK_UPDATE", new_update["id"], f"Logged {new_update['hoursSpent']}h on {new_update['workDate']}")
-    return {"workUpdate": new_update}
+    created = WorkUpdateRepository.create(new_upd)
+    AuditLogRepository.log(user["id"], user["email"], "WORK_UPDATE_CREATED", "WORK_UPDATE", new_upd["id"], f"Logged {payload.hoursSpent}h for {payload.workDate}")
+    return {"workUpdate": created}
 
-@app.put("/api/work-updates/{update_id}")
-def api_update_work_update(update_id: str, payload: WorkUpdateUpdatePayload, user: dict = Depends(get_current_user)):
-    upd = next((u for u in db.work_updates if u["id"] == update_id), None)
-    if not upd:
+@work_updates_router.put("/{upd_id}")
+def update_work_update(upd_id: str, payload: WorkUpdateUpdatePayload, user: Dict[str, Any] = Depends(get_current_user)):
+    existing = WorkUpdateRepository.find_by_id(upd_id)
+    if not existing:
         raise HTTPException(status_code=404, detail="Work update not found.")
-    if upd["employeeId"] != user["id"]:
-        raise HTTPException(status_code=403, detail="Unauthorized to edit this update.")
+    if existing["employeeId"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Unauthorized to modify this work update.")
 
-    if payload.workDate is not None:
-        upd["workDate"] = payload.workDate
-    if payload.hoursSpent is not None:
-        upd["hoursSpent"] = payload.hoursSpent
-    if payload.projectTag is not None:
-        upd["projectTag"] = payload.projectTag
-    if payload.description is not None:
-        upd["description"] = payload.description
+    updates = {k: v for k, v in payload.dict().items() if v is not None}
+    updates["updatedAt"] = get_now_iso()
+    updated = WorkUpdateRepository.update(upd_id, updates)
+    return {"workUpdate": updated}
 
-    upd["updatedAt"] = get_now_iso()
-    return {"workUpdate": upd}
-
-@app.delete("/api/work-updates/{update_id}")
-def api_delete_work_update(update_id: str, user: dict = Depends(get_current_user)):
-    upd = next((u for u in db.work_updates if u["id"] == update_id), None)
-    if not upd:
+@work_updates_router.delete("/{upd_id}")
+def delete_work_update(upd_id: str, user: Dict[str, Any] = Depends(get_current_user)):
+    existing = WorkUpdateRepository.find_by_id(upd_id)
+    if not existing:
         raise HTTPException(status_code=404, detail="Work update not found.")
-    if upd["employeeId"] != user["id"]:
-        raise HTTPException(status_code=403, detail="Unauthorized to delete this update.")
+    if existing["employeeId"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Unauthorized to delete this work update.")
 
-    db.work_updates = [u for u in db.work_updates if u["id"] != update_id]
-    db.log_audit(user["id"], user["email"], "WORK_UPDATE_DELETED", "WORK_UPDATE", update_id, f"Deleted work update for {upd['workDate']}")
+    WorkUpdateRepository.delete(upd_id)
+    AuditLogRepository.log(user["id"], user["email"], "WORK_UPDATE_DELETED", "WORK_UPDATE", upd_id, "Deleted work update")
     return {"message": "Work update deleted successfully."}
 
-# --- REPORTS ---
-@app.get("/api/reports/current")
-def api_get_current_report(user: dict = Depends(get_current_user)):
-    if user.get("role") != "EMPLOYEE":
-        raise HTTPException(status_code=400, detail="Current report endpoint is for employee users.")
+# --- Reports Endpoints ---
+@reports_router.get("")
+def list_reports(user: Dict[str, Any] = Depends(get_current_user)):
+    if user["role"] == "MANAGER":
+        reports = WeeklyReportRepository.find_by_manager(user["id"])
+    else:
+        reports = WeeklyReportRepository.find_by_employee(user["id"])
+    return {"reports": reports}
 
-    week_info = get_reporting_week()
-    week_start = week_info["weekStart"]
-    week_end = week_info["weekEnd"]
+@reports_router.get("/current")
+def get_current_report(user: Dict[str, Any] = Depends(get_current_user)):
+    return WeeklyReportService.get_or_create_current_report(user)
 
-    report = next((r for r in db.weekly_reports if r["employeeId"] == user["id"] and r["weekStart"] == week_start), None)
+@reports_router.get("/history")
+def get_report_history(user: Dict[str, Any] = Depends(get_current_user)):
+    reports = WeeklyReportRepository.find_by_employee(user["id"])
+    return {"reports": reports}
+
+@reports_router.get("/{report_id}")
+def get_report_by_id(report_id: str, user: Dict[str, Any] = Depends(get_current_user)):
+    report = WeeklyReportRepository.find_by_id(report_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="Weekly report not found.")
+    if report["employeeId"] != user["id"] and report.get("managerId") != user["id"]:
+        raise HTTPException(status_code=403, detail="Unauthorized access to this report.")
+    
+    updates = WorkUpdateRepository.find(report["employeeId"], report["weekStart"], report["weekEnd"])
+    return {"report": report, "workUpdates": updates}
+
+@reports_router.post("/draft")
+def save_draft(payload: DraftSavePayload, user: Dict[str, Any] = Depends(get_current_user)):
+    curr_week = get_reporting_week()
+    w_start = payload.weekStart or curr_week["weekStart"]
+    w_end = payload.weekEnd or curr_week["weekEnd"]
+
+    report = None
+    if payload.reportId:
+        report = WeeklyReportRepository.find_by_id(payload.reportId)
+    if not report:
+        report = WeeklyReportRepository.find_by_employee_and_week(user["id"], w_start)
 
     if not report:
-        now = get_now_iso()
         report = {
             "id": f"rep-{int(time.time()*1000)}",
             "employeeId": user["id"],
             "employeeName": user["name"],
             "employeeEmail": user["email"],
-            "managerId": user.get("managerId", ""),
-            "weekStart": week_start,
-            "weekEnd": week_end,
-            "status": "DRAFT",
-            "answers": {
-                "accomplishments": "",
-                "inProgress": "",
-                "blockers": "",
-                "nextWeekPriorities": ""
-            },
-            "aiStatus": "NOT_STARTED",
-            "aiSummary": None,
-            "submittedAt": None,
-            "createdAt": now,
-            "updatedAt": now
-        }
-        db.weekly_reports.append(report)
-        db.log_audit(user["id"], user["email"], "REPORT_DRAFT_INITIALIZED", "REPORT", report["id"], f"Created draft for week {week_start}")
-
-    work_updates = [u for u in db.work_updates if u["employeeId"] == user["id"] and week_start <= u["workDate"] <= week_end]
-    work_updates.sort(key=lambda x: x["workDate"], reverse=True)
-
-    return {
-        "report": report,
-        "workUpdates": work_updates
-    }
-
-@app.get("/api/reports/history")
-def api_get_report_history(user: dict = Depends(get_current_user)):
-    if user.get("role") != "EMPLOYEE":
-        raise HTTPException(status_code=403, detail="Report history is for employee users.")
-    reports = [r for r in db.weekly_reports if r["employeeId"] == user["id"]]
-    reports.sort(key=lambda x: x["weekStart"], reverse=True)
-    return {"reports": reports}
-
-@app.get("/api/reports/{report_id}")
-def api_get_report_by_id(report_id: str, user: dict = Depends(get_current_user)):
-    report = next((r for r in db.weekly_reports if r["id"] == report_id), None)
-    if not report:
-        raise HTTPException(status_code=404, detail="Report not found.")
-
-    # Check permission
-    if user.get("role") == "EMPLOYEE" and report["employeeId"] != user["id"]:
-        raise HTTPException(status_code=403, detail="Unauthorized access to this report.")
-    if user.get("role") == "MANAGER" and report["managerId"] != user["id"]:
-        # Allow if employee belongs to manager
-        emp = next((u for u in db.users if u["id"] == report["employeeId"] and u["managerId"] == user["id"]), None)
-        if not emp:
-            raise HTTPException(status_code=403, detail="Unauthorized access to this report.")
-
-    work_updates = [u for u in db.work_updates if u["employeeId"] == report["employeeId"] and report["weekStart"] <= u["workDate"] <= report["weekEnd"]]
-    work_updates.sort(key=lambda x: x["workDate"], reverse=True)
-
-    return {
-        "report": report,
-        "workUpdates": work_updates
-    }
-
-@app.post("/api/reports/draft")
-def api_save_draft(payload: DraftSavePayload, user: dict = Depends(get_current_user)):
-    if user.get("role") != "EMPLOYEE":
-        raise HTTPException(status_code=403, detail="Only employees can save draft reports.")
-
-    report = None
-    if payload.reportId:
-        report = next((r for r in db.weekly_reports if r["id"] == payload.reportId), None)
-    elif payload.weekStart:
-        report = next((r for r in db.weekly_reports if r["employeeId"] == user["id"] and r["weekStart"] == payload.weekStart), None)
-
-    if report and report.get("status") == "SUBMITTED":
-        raise HTTPException(status_code=400, detail="Cannot edit an already submitted report.")
-
-    now = get_now_iso()
-    raw_answers = payload.answers.dict() if payload.answers else {}
-
-    if report:
-        report["answers"].update(raw_answers)
-        report["updatedAt"] = now
-        db.log_audit(user["id"], user["email"], "REPORT_DRAFT_SAVED", "REPORT", report["id"], "Draft updated")
-        return {"report": report, "message": "Draft saved successfully."}
-    else:
-        week_info = get_reporting_week()
-        w_start = payload.weekStart or week_info["weekStart"]
-        w_end = payload.weekEnd or week_info["weekEnd"]
-        new_report = {
-            "id": f"rep-{int(time.time()*1000)}",
-            "employeeId": user["id"],
-            "employeeName": user["name"],
-            "employeeEmail": user["email"],
-            "managerId": user.get("managerId", ""),
+            "managerId": user.get("managerId"),
             "weekStart": w_start,
             "weekEnd": w_end,
             "status": "DRAFT",
-            "answers": raw_answers,
-            "aiStatus": "NOT_STARTED",
+            "reviewStatus": "PENDING",
+            "answers": payload.answers or {},
             "aiSummary": None,
-            "submittedAt": None,
-            "createdAt": now,
-            "updatedAt": now
+            "aiStatus": "NOT_STARTED",
+            "createdAt": get_now_iso(),
+            "updatedAt": get_now_iso()
         }
-        db.weekly_reports.append(new_report)
-        db.log_audit(user["id"], user["email"], "REPORT_DRAFT_CREATED", "REPORT", new_report["id"], "New draft created")
-        return {"report": new_report, "message": "Draft created successfully."}
+    else:
+        if payload.answers:
+            report["answers"].update(payload.answers)
+        report["updatedAt"] = get_now_iso()
 
-@app.post("/api/reports/{report_id}/submit")
-def api_submit_report(report_id: str, payload: SubmitPayload, user: dict = Depends(get_current_user)):
-    if user.get("role") != "EMPLOYEE":
-        raise HTTPException(status_code=403, detail="Only employees can submit weekly reports.")
+    saved = WeeklyReportRepository.save(report)
+    return {"report": saved}
 
-    report = next((r for r in db.weekly_reports if r["id"] == report_id), None)
+@reports_router.post("/{report_id}/submit")
+def submit_report(report_id: str, payload: SubmitPayload = None, user: Dict[str, Any] = Depends(get_current_user)):
+    answers = payload.answers if payload else None
+    return WeeklyReportService.submit_report(report_id, user, answers)
+
+@reports_router.post("/{report_id}/generate-summary")
+def generate_summary(report_id: str, user: Dict[str, Any] = Depends(get_current_user)):
+    report = WeeklyReportRepository.find_by_id(report_id)
     if not report:
         raise HTTPException(status_code=404, detail="Report not found.")
-    if report["employeeId"] != user["id"]:
-        raise HTTPException(status_code=403, detail="Unauthorized access.")
-    if report["status"] == "SUBMITTED":
-        raise HTTPException(status_code=400, detail="Report has already been submitted.")
+    if report["employeeId"] != user["id"] and report.get("managerId") != user["id"]:
+        raise HTTPException(status_code=403, detail="Unauthorized access to this report.")
 
-    if payload.answers:
-        report["answers"].update(payload.answers.dict())
-
-    # Get work updates for that week
-    work_updates = [u for u in db.work_updates if u["employeeId"] == user["id"] and report["weekStart"] <= u["workDate"] <= report["weekEnd"]]
-
-    # Run AI Synthesis
-    ai_summary = synthesize_executive_summary(
-        employee_name=user["name"],
-        reporting_period=f"{report['weekStart']} to {report['weekEnd']}",
-        work_updates=work_updates,
-        answers=report["answers"]
+    updates = WorkUpdateRepository.find(report["employeeId"], report["weekStart"], report["weekEnd"])
+    summary = AISummaryService.synthesize(
+        report["employeeName"],
+        f"{report['weekStart']} to {report['weekEnd']}",
+        updates,
+        report["answers"]
     )
-
-    now = get_now_iso()
-    report["status"] = "SUBMITTED"
-    report["submittedAt"] = now
+    report["aiSummary"] = summary
     report["aiStatus"] = "COMPLETED"
-    report["aiSummary"] = ai_summary
-    report["updatedAt"] = now
-
-    db.log_audit(user["id"], user["email"], "REPORT_SUBMITTED", "REPORT", report["id"], f"Report submitted for week {report['weekStart']}")
-
-    return {
-        "report": report,
-        "workUpdates": work_updates,
-        "message": "Weekly report submitted and synthesized successfully."
-    }
-
-@app.post("/api/reports/{report_id}/retry-ai")
-def api_retry_ai(report_id: str, user: dict = Depends(get_current_user)):
-    report = next((r for r in db.weekly_reports if r["id"] == report_id), None)
-    if not report:
-        raise HTTPException(status_code=404, detail="Report not found.")
-
-    work_updates = [u for u in db.work_updates if u["employeeId"] == report["employeeId"] and report["weekStart"] <= u["workDate"] <= report["weekEnd"]]
-    ai_summary = synthesize_executive_summary(
-        employee_name=report["employeeName"],
-        reporting_period=f"{report['weekStart']} to {report['weekEnd']}",
-        work_updates=work_updates,
-        answers=report["answers"]
-    )
-    report["aiStatus"] = "COMPLETED"
-    report["aiSummary"] = ai_summary
     report["updatedAt"] = get_now_iso()
+    WeeklyReportRepository.save(report)
+    return {"aiSummary": summary, "report": report}
 
-    return {
-        "report": report,
-        "workUpdates": work_updates,
-        "message": "Executive AI summary re-generated."
-    }
-
-# --- MANAGER ENDPOINTS ---
-@app.get("/api/manager/employees")
-def api_manager_employees(user: dict = Depends(get_current_user)):
-    if user.get("role") != "MANAGER":
-        raise HTTPException(status_code=403, detail="Manager access required.")
-
-    assigned_employees = [u for u in db.users if u.get("managerId") == user["id"]]
-    week_info = get_reporting_week()
-    w_start = week_info["weekStart"]
-    w_end = week_info["weekEnd"]
-
-    summaries = []
-    for emp in assigned_employees:
-        curr_rep = next((r for r in db.weekly_reports if r["employeeId"] == emp["id"] and r["weekStart"] == w_start), None)
-        emp_updates = [u for u in db.work_updates if u["employeeId"] == emp["id"] and w_start <= u["workDate"] <= w_end]
-        total_hours = sum(u.get("hoursSpent", 0) for u in emp_updates)
-
-        summaries.append({
-            "id": emp["id"],
-            "name": emp["name"],
-            "email": emp["email"],
-            "department": emp["department"],
-            "title": emp["title"],
-            "currentWeek": {
-                "weekStart": w_start,
-                "weekEnd": w_end,
-                "reportId": curr_rep["id"] if curr_rep else None,
-                "status": curr_rep["status"] if curr_rep else "NOT_STARTED",
-                "aiStatus": curr_rep.get("aiStatus", "NOT_STARTED") if curr_rep else "NOT_STARTED",
-                "submittedAt": curr_rep.get("submittedAt") if curr_rep else None,
-                "workUpdateCount": len(emp_updates),
-                "totalHoursLogged": total_hours,
-                "lastActive": emp_updates[0]["createdAt"] if emp_updates else None
-            }
-        })
-
-    return {
-        "manager": {
-            "id": user["id"],
-            "name": user["name"],
-            "email": user["email"],
-            "department": user.get("department"),
-            "title": user.get("title")
-        },
-        "reportingWeek": week_info,
-        "employees": summaries
-    }
-
-@app.get("/api/manager/reports")
-def api_manager_reports(user: dict = Depends(get_current_user)):
-    if user.get("role") != "MANAGER":
-        raise HTTPException(status_code=403, detail="Manager access required.")
-
-    assigned_emp_ids = {u["id"] for u in db.users if u.get("managerId") == user["id"]}
-    reports = [r for r in db.weekly_reports if r["employeeId"] in assigned_emp_ids or r.get("managerId") == user["id"]]
-    reports.sort(key=lambda x: x["weekStart"], reverse=True)
-
-    return {
-        "reports": reports,
-        "totalCount": len(reports)
-    }
-
-@app.get("/api/manager/reports/{report_id}")
-def api_manager_report_detail(report_id: str, user: dict = Depends(get_current_user)):
-    if user.get("role") != "MANAGER":
-        raise HTTPException(status_code=403, detail="Manager access required.")
-
-    report = next((r for r in db.weekly_reports if r["id"] == report_id), None)
+@reports_router.post("/{report_id}/review")
+def review_report(report_id: str, payload: ReviewPayload, user: Dict[str, Any] = Depends(require_manager)):
+    report = WeeklyReportRepository.find_by_id(report_id)
     if not report:
         raise HTTPException(status_code=404, detail="Report not found.")
+    if report.get("managerId") != user["id"]:
+        raise HTTPException(status_code=403, detail="Unauthorized: this employee does not report to you.")
 
-    assigned_emp_ids = {u["id"] for u in db.users if u.get("managerId") == user["id"]}
-    if report["employeeId"] not in assigned_emp_ids and report.get("managerId") != user["id"]:
-        raise HTTPException(status_code=403, detail="Unauthorized access to non-assigned employee report.")
+    report["reviewStatus"] = payload.status
+    report["managerFeedback"] = payload.managerFeedback or ""
+    report["reviewedAt"] = get_now_iso()
+    report["updatedAt"] = get_now_iso()
+    saved = WeeklyReportRepository.save(report)
+    AuditLogRepository.log(user["id"], user["email"], "REPORT_REVIEWED", "REPORT", report_id, f"Report reviewed with status: {payload.status}")
+    return {"report": saved}
 
-    work_updates = [u for u in db.work_updates if u["employeeId"] == report["employeeId"] and report["weekStart"] <= u["workDate"] <= report["weekEnd"]]
-    work_updates.sort(key=lambda x: x["workDate"], reverse=True)
+# --- Manager Endpoints ---
+@manager_router.get("/team-members")
+def get_team_members(user: Dict[str, Any] = Depends(require_manager)):
+    members = UserRepository.find_by_manager(user["id"])
+    curr_week = get_reporting_week()
+    
+    result = []
+    for m in members:
+        rep = WeeklyReportRepository.find_by_employee_and_week(m["id"], curr_week["weekStart"])
+        updates = WorkUpdateRepository.find(m["id"], curr_week["weekStart"], curr_week["weekEnd"])
+        total_hours = sum(u.get("hoursSpent", 0) for u in updates)
+        
+        result.append({
+            "id": m["id"],
+            "name": m["name"],
+            "email": m["email"],
+            "department": m["department"],
+            "title": m["title"],
+            "currentReportStatus": rep.get("status", "NOT_STARTED") if rep else "NOT_STARTED",
+            "currentReportId": rep.get("id") if rep else None,
+            "totalHoursLogged": total_hours,
+            "updateCount": len(updates),
+            "lastActive": updates[0]["createdAt"] if updates else m["createdAt"]
+        })
+    return {"teamMembers": result}
 
-    db.log_audit(user["id"], user["email"], "MANAGER_VIEW_REPORT", "REPORT", report["id"], f"Manager viewed report of {report['employeeName']}")
+@manager_router.get("/team-reports")
+def get_team_reports(weekStart: Optional[str] = Query(None), user: Dict[str, Any] = Depends(require_manager)):
+    reports = WeeklyReportRepository.find_by_manager(user["id"])
+    if weekStart:
+        reports = [r for r in reports if r.get("weekStart") == weekStart]
+    return {"reports": reports}
+
+@manager_router.get("/team-stats")
+def get_team_stats(user: Dict[str, Any] = Depends(require_manager)):
+    members = UserRepository.find_by_manager(user["id"])
+    curr_week = get_reporting_week()
+    reports = WeeklyReportRepository.find_by_manager(user["id"])
+    curr_reports = [r for r in reports if r.get("weekStart") == curr_week["weekStart"]]
+    
+    submitted_count = len([r for r in curr_reports if r.get("status") == "SUBMITTED"])
+    total_members = len(members)
+    submission_rate = round((submitted_count / total_members * 100), 1) if total_members > 0 else 0.0
+
+    all_updates = []
+    for m in members:
+        all_updates.extend(WorkUpdateRepository.find(m["id"], curr_week["weekStart"], curr_week["weekEnd"]))
+    
+    total_hours = sum(u.get("hoursSpent", 0) for u in all_updates)
+    blockers_count = sum(1 for r in curr_reports if r.get("answers", {}).get("blockers", "").strip() and "no" not in r.get("answers", {}).get("blockers", "").lower())
 
     return {
-        "report": report,
-        "workUpdates": work_updates
+        "totalTeamMembers": total_members,
+        "submittedReportsCount": submitted_count,
+        "submissionRate": submission_rate,
+        "totalHoursLogged": total_hours,
+        "activeBlockersCount": blockers_count,
+        "weekStart": curr_week["weekStart"],
+        "weekEnd": curr_week["weekEnd"]
     }
 
-@app.get("/api/manager/audit-logs")
-def api_manager_audit_logs(user: dict = Depends(get_current_user)):
-    if user.get("role") != "MANAGER":
-        raise HTTPException(status_code=403, detail="Manager access required.")
-    return {"logs": db.audit_logs[:100]}
-
-# --- Production SPA Fallback (if built into dist) ---
-if os.path.exists("dist"):
-    app.mount("/assets", StaticFiles(directory="dist/assets"), name="assets")
-
-    @app.get("/{full_path:path}")
-    def serve_frontend_spa(full_path: str):
-        file_path = os.path.join("dist", full_path)
-        if os.path.exists(file_path) and os.path.isfile(file_path):
-            return FileResponse(file_path)
-        return FileResponse("dist/index.html")
-
-if __name__ == "__main__":
-    import uvicorn
-    print(f"==================================================")
-    print(f" WorkPulse FastAPI Server on 0.0.0.0:{PORT}")
-    print(f"==================================================")
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)
+# Mount Routers
+app.include_router(auth_router)
+app.include_router(questions_router)
+app.include_router(work_updates_router)
+app.include_router(reports_router)
+app.include_router(manager_router)

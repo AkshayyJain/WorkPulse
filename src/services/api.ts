@@ -208,6 +208,25 @@ class ApiService {
   async getAuditLogs(): Promise<{ logs: AuditLog[] }> {
     return this.request<{ logs: AuditLog[] }>('/manager/audit-logs');
   }
+
+  // --- Diagnostics & Database APIs ---
+  async getDbStatus(): Promise<{
+    databaseType: string;
+    connected: boolean;
+    databaseName: string;
+    latencyMs?: number;
+    collections?: {
+      users: number;
+      work_updates: number;
+      weekly_reports: number;
+      questions: number;
+      audit_logs: number;
+    };
+    uriConfigured: boolean;
+    error?: string;
+  }> {
+    return this.request('/db-status');
+  }
 }
 
 export const api = new ApiService();

@@ -16,13 +16,22 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(() => {
-    const savedUser = localStorage.getItem('workpulse_user');
-    return savedUser ? JSON.parse(savedUser) : null;
+    try {
+      const savedUser = localStorage.getItem('workpulse_user');
+      return savedUser ? JSON.parse(savedUser) : null;
+    } catch {
+      localStorage.removeItem('workpulse_user');
+      return null;
+    }
   });
   const [token, setToken] = useState<string | null>(() => {
-    return localStorage.getItem('workpulse_token');
+    try {
+      return localStorage.getItem('workpulse_token');
+    } catch {
+      return null;
+    }
   });
-  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [isLoading, setIsLoading] = useState<boolean>(false);
 
   useEffect(() => {
     const checkAuth = async () => {

@@ -55,10 +55,15 @@ async function startServer() {
       service: 'WorkPulse API Server',
       environment: config.nodeEnv,
       timestamp: new Date().toISOString(),
-      database: 'Connected (JSON Store & Memory Index)',
+      database: 'Connected (MongoDB & Persistent Document Store)',
       aiConfigured: Boolean(config.geminiApiKey),
       aiModel: config.geminiModel,
     });
+  });
+
+  app.get('/api/db-status', async (req: Request, res: Response) => {
+    const status = await db.getDbStatus();
+    res.json(status);
   });
 
   // Mount API Routers

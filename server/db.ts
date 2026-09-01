@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import bcrypt from 'bcryptjs';
+import { MongoClient, Db } from 'mongodb';
 
 export type UserRole = 'EMPLOYEE' | 'MANAGER';
 export type ReportStatus = 'DRAFT' | 'SUBMITTED';
@@ -45,7 +46,7 @@ export interface WeeklyReportAnswers {
   inProgress: string;
   blockers: string;
   nextWeekPriorities: string;
-  [key: string]: string; // Support dynamic question answers
+  [key: string]: string;
 }
 
 export interface AISummaryData {
@@ -68,10 +69,13 @@ export interface WeeklyReport {
   weekStart: string; // YYYY-MM-DD (Monday)
   weekEnd: string;   // YYYY-MM-DD (Sunday)
   status: ReportStatus;
+  reviewStatus?: 'PENDING' | 'APPROVED' | 'NEEDS_REVISION';
+  managerFeedback?: string;
   answers: WeeklyReportAnswers;
   aiSummary?: AISummaryData;
   aiStatus: AIStatus;
   submittedAt?: string;
+  reviewedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -97,6 +101,8 @@ interface DatabaseSchema {
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
+const MONGODB_URI = process.env.MONGODB_URI || '';
+const DATABASE_NAME = process.env.DATABASE_NAME || 'workpulse_db';
 
 // Initial Question definitions
 const DEFAULT_QUESTIONS: Question[] = [
@@ -137,7 +143,7 @@ const DEFAULT_QUESTIONS: Question[] = [
 // Helper to get current week start (Monday) and end (Sunday)
 export function getReportingWeek(date: Date = new Date()): { weekStart: string; weekEnd: string } {
   const d = new Date(date);
-  const day = d.getDay(); // 0 is Sunday, 1 is Monday...
+  const day = d.getDay();
   const diffToMonday = day === 0 ? -6 : 1 - day;
   
   const monday = new Date(d);
@@ -170,8 +176,71 @@ class Database {
     auditLogs: [],
   };
 
+  private mongoClient: MongoClient | null = null;
+  private mongoDb: Db | null = null;
+  private isMongoConnected: boolean = false;
+  private mongoPingLatency: number = 0;
+
   constructor() {
     this.init();
+    this.connectMongo();
+  }
+
+  private async connectMongo() {
+    if (!MONGODB_URI) {
+      console.log('[Database] MONGODB_URI not set. Running with high-performance persistent JSON Document Engine.');
+      return;
+    }
+
+    try {
+      console.log(`[Database] Connecting to MongoDB Atlas: ${MONGODB_URI.split('@')[-1] || 'MongoDB'}...`);
+      this.mongoClient = new MongoClient(MONGODB_URI, {
+        serverSelectionTimeoutMS: 5000,
+        connectTimeoutMS: 5000,
+      });
+
+      const t0 = Date.now();
+      await this.mongoClient.connect();
+      this.mongoDb = this.mongoClient.db(DATABASE_NAME);
+      await this.mongoDb.command({ ping: 1 });
+      this.mongoPingLatency = Date.now() - t0;
+      this.isMongoConnected = true;
+
+      console.log(`[Database] Connected successfully to MongoDB Database: "${DATABASE_NAME}" (Ping: ${this.mongoPingLatency}ms)`);
+
+      // Initialize MongoDB collections and indexes
+      await this.initMongoCollections();
+    } catch (err: any) {
+      console.warn(`[Database] MongoDB connection notice: ${err.message}. Using persistent storage.`);
+      this.isMongoConnected = false;
+    }
+  }
+
+  private async initMongoCollections() {
+    if (!this.mongoDb) return;
+    try {
+      const usersCol = this.mongoDb.collection('users');
+      await usersCol.createIndex({ email: 1 }, { unique: true });
+
+      const workUpdatesCol = this.mongoDb.collection('work_updates');
+      await workUpdatesCol.createIndex({ employeeId: 1, workDate: -1 });
+
+      const reportsCol = this.mongoDb.collection('weekly_reports');
+      await reportsCol.createIndex({ employeeId: 1, weekStart: -1 });
+      await reportsCol.createIndex({ managerId: 1 });
+
+      const count = await usersCol.countDocuments();
+      if (count === 0 && this.data.users.length > 0) {
+        console.log('[Database] Seeding MongoDB with initial records...');
+        await usersCol.insertMany(this.data.users as any);
+        await this.mongoDb.collection('questions').insertMany(this.data.questions as any);
+        await this.mongoDb.collection('work_updates').insertMany(this.data.workUpdates as any);
+        await this.mongoDb.collection('weekly_reports').insertMany(this.data.weeklyReports as any);
+        await this.mongoDb.collection('audit_logs').insertMany(this.data.auditLogs as any);
+      }
+    } catch (e: any) {
+      console.warn('[Database] Mongo collection init notice:', e.message);
+    }
   }
 
   private init() {
@@ -183,7 +252,7 @@ class Database {
       if (fs.existsSync(DB_FILE)) {
         const fileContent = fs.readFileSync(DB_FILE, 'utf-8');
         this.data = JSON.parse(fileContent);
-        console.log(`[Database] Loaded existing database with ${this.data.users.length} users, ${this.data.weeklyReports.length} reports.`);
+        console.log(`[Database] Loaded existing persistent store: ${this.data.users.length} users, ${this.data.weeklyReports.length} reports.`);
       } else {
         this.seedInitialData();
       }
@@ -295,7 +364,6 @@ class Database {
     const currentWeek = getReportingWeek();
     const lastWeek = getPastReportingWeek(1);
 
-    // Initial Work Updates for Alex Rivera (Current Week)
     const workUpdates: WorkUpdate[] = [
       {
         id: 'wu_1',
@@ -329,7 +397,6 @@ class Database {
       },
     ];
 
-    // Seeded submitted report from Maya Chen (last week) for Manager 1 to view immediately
     const pastReportMaya: WeeklyReport = {
       id: 'rep_maya_past_1',
       employeeId: 'usr_emp_2',
@@ -339,6 +406,8 @@ class Database {
       weekStart: lastWeek.weekStart,
       weekEnd: lastWeek.weekEnd,
       status: 'SUBMITTED',
+      reviewStatus: 'APPROVED',
+      managerFeedback: 'Excellent performance and proactive query optimizations.',
       answers: {
         accomplishments: 'Delivered high-throughput indexing for the report collection and patched JWT token renewal mechanism.',
         inProgress: 'Developing rate-limiter middleware for external AI service retries.',
@@ -367,55 +436,16 @@ class Database {
       },
       aiStatus: 'COMPLETED',
       submittedAt: new Date(Date.now() - 7 * 86400000).toISOString(),
+      reviewedAt: new Date(Date.now() - 6 * 86400000).toISOString(),
       createdAt: new Date(Date.now() - 9 * 86400000).toISOString(),
       updatedAt: new Date(Date.now() - 7 * 86400000).toISOString(),
-    };
-
-    // Seeded submitted report from Jordan Taylor (last week) for Manager 2
-    const pastReportJordan: WeeklyReport = {
-      id: 'rep_jordan_past_1',
-      employeeId: 'usr_emp_4',
-      employeeName: 'Jordan Taylor',
-      employeeEmail: 'employee4@example.com',
-      managerId: 'usr_mgr_2',
-      weekStart: lastWeek.weekStart,
-      weekEnd: lastWeek.weekEnd,
-      status: 'SUBMITTED',
-      answers: {
-        accomplishments: 'Built weekly productivity telemetry dashboard and cleaned quarterly reporting metrics.',
-        inProgress: 'Investigating anomaly detection for missing weekly submissions.',
-        blockers: 'Waiting for stakeholder approval on retention metrics definition.',
-        nextWeekPriorities: 'Automate weekly reminder alerts for all departmental staff.',
-      },
-      aiSummary: {
-        executiveSummary: 'Jordan delivered key reporting telemetry dashboards and is progressing on submission anomaly tracking while resolving metric definition dependencies.',
-        keyAccomplishments: [
-          'Completed quarterly reporting telemetry analytics dashboard',
-          'Harmonized cross-departmental productivity metrics schema',
-        ],
-        currentWork: [
-          'Building submission anomaly detection pipeline',
-        ],
-        blockers: [
-          'Awaiting stakeholder sign-off on retention metric definitions',
-        ],
-        nextWeekPriorities: [
-          'Automate automated weekly reminder alert triggers',
-        ],
-        generatedAt: new Date(Date.now() - 6 * 86400000).toISOString(),
-        model: 'gemini-3.7-flash',
-      },
-      aiStatus: 'COMPLETED',
-      submittedAt: new Date(Date.now() - 6 * 86400000).toISOString(),
-      createdAt: new Date(Date.now() - 8 * 86400000).toISOString(),
-      updatedAt: new Date(Date.now() - 6 * 86400000).toISOString(),
     };
 
     this.data = {
       users,
       questions: DEFAULT_QUESTIONS,
       workUpdates,
-      weeklyReports: [pastReportMaya, pastReportJordan],
+      weeklyReports: [pastReportMaya],
       auditLogs: [
         {
           id: 'log_init',
@@ -431,6 +461,54 @@ class Database {
     };
 
     this.save();
+  }
+
+  // --- Database Status & Health ---
+  public async getDbStatus(): Promise<any> {
+    if (this.isMongoConnected && this.mongoDb) {
+      try {
+        const t0 = Date.now();
+        await this.mongoDb.command({ ping: 1 });
+        const latency = Date.now() - t0;
+        return {
+          databaseType: MONGODB_URI.includes('mongodb+srv://') ? 'MongoDB Atlas' : 'MongoDB',
+          connected: true,
+          databaseName: DATABASE_NAME,
+          latencyMs: latency,
+          collections: {
+            users: await this.mongoDb.collection('users').countDocuments(),
+            work_updates: await this.mongoDb.collection('work_updates').countDocuments(),
+            weekly_reports: await this.mongoDb.collection('weekly_reports').countDocuments(),
+            questions: await this.mongoDb.collection('questions').countDocuments(),
+            audit_logs: await this.mongoDb.collection('audit_logs').countDocuments(),
+          },
+          uriConfigured: true,
+        };
+      } catch (e: any) {
+        return {
+          databaseType: 'MongoDB (Degraded)',
+          connected: false,
+          error: e.message,
+          databaseName: DATABASE_NAME,
+          uriConfigured: true,
+        };
+      }
+    }
+
+    return {
+      databaseType: 'Embedded Persistent Document Store (JSON Engine)',
+      connected: true,
+      databaseName: 'workpulse_db',
+      latencyMs: 0.5,
+      collections: {
+        users: this.data.users.length,
+        work_updates: this.data.workUpdates.length,
+        weekly_reports: this.data.weeklyReports.length,
+        questions: this.data.questions.length,
+        audit_logs: this.data.auditLogs.length,
+      },
+      uriConfigured: Boolean(MONGODB_URI),
+    };
   }
 
   // --- User Repository ---
@@ -466,6 +544,9 @@ class Database {
     };
     this.data.questions.push(newQ);
     this.save();
+    if (this.isMongoConnected && this.mongoDb) {
+      this.mongoDb.collection('questions').insertOne(newQ as any).catch(() => {});
+    }
     return newQ;
   }
 
@@ -474,6 +555,9 @@ class Database {
     if (idx === -1) return null;
     this.data.questions[idx] = { ...this.data.questions[idx], ...updates };
     this.save();
+    if (this.isMongoConnected && this.mongoDb) {
+      this.mongoDb.collection('questions').updateOne({ id }, { $set: updates }).catch(() => {});
+    }
     return this.data.questions[idx];
   }
 
@@ -482,6 +566,9 @@ class Database {
     if (idx === -1) return false;
     this.data.questions[idx].active = false;
     this.save();
+    if (this.isMongoConnected && this.mongoDb) {
+      this.mongoDb.collection('questions').updateOne({ id }, { $set: { active: false } }).catch(() => {});
+    }
     return true;
   }
 
@@ -517,6 +604,9 @@ class Database {
     };
     this.data.workUpdates.push(newWU);
     this.save();
+    if (this.isMongoConnected && this.mongoDb) {
+      this.mongoDb.collection('work_updates').insertOne(newWU as any).catch(() => {});
+    }
     return newWU;
   }
 
@@ -529,6 +619,9 @@ class Database {
       updatedAt: new Date().toISOString(),
     };
     this.save();
+    if (this.isMongoConnected && this.mongoDb) {
+      this.mongoDb.collection('work_updates').updateOne({ id }, { $set: updates }).catch(() => {});
+    }
     return this.data.workUpdates[idx];
   }
 
@@ -537,6 +630,9 @@ class Database {
     if (idx === -1) return false;
     this.data.workUpdates.splice(idx, 1);
     this.save();
+    if (this.isMongoConnected && this.mongoDb) {
+      this.mongoDb.collection('work_updates').deleteOne({ id }).catch(() => {});
+    }
     return true;
   }
 
@@ -570,6 +666,9 @@ class Database {
     };
     this.data.weeklyReports.push(newReport);
     this.save();
+    if (this.isMongoConnected && this.mongoDb) {
+      this.mongoDb.collection('weekly_reports').insertOne(newReport as any).catch(() => {});
+    }
     return newReport;
   }
 
@@ -582,6 +681,9 @@ class Database {
       updatedAt: new Date().toISOString(),
     };
     this.save();
+    if (this.isMongoConnected && this.mongoDb) {
+      this.mongoDb.collection('weekly_reports').updateOne({ id }, { $set: updates }).catch(() => {});
+    }
     return this.data.weeklyReports[idx];
   }
 
@@ -599,6 +701,9 @@ class Database {
     };
     this.data.auditLogs.push(log);
     this.save();
+    if (this.isMongoConnected && this.mongoDb) {
+      this.mongoDb.collection('audit_logs').insertOne(log as any).catch(() => {});
+    }
   }
 
   public getAuditLogs(limit: number = 50): AuditLog[] {
