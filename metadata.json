@@ -1,0 +1,8 @@
+{
+  "name": "WorkPulse - Employee Work & Weekly Reporting System",
+  "description": "A comprehensive Employee Work & Weekly Reporting System with Daily Updates, 4-Question Weekly Reports, Gemini AI Summarization, Role-Based Access Control for Employees and Managers, Dark/Light Theme Switching, and PDF Export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
