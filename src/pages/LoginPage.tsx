@@ -243,7 +243,7 @@ export function LoginPage() {
 
       {/* Footer */}
       <footer className="py-4 text-center text-xs text-slate-500 dark:text-slate-500 border-t border-slate-200 dark:border-slate-800">
-        WorkPulse Weekly Reporting System • Ready to Deploy
+         © 2026 WorkPulse Weekly Reporting System
       </footer>
     </div>
   );
