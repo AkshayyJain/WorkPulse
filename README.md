@@ -30,7 +30,7 @@ An enterprise weekly work tracking and management reporting platform built with 
 
 ---
 
-## 🔄 API & User Lifecycle Flow
+## 🔄 User Lifecycle Flow
 
 1. **Login & Session Acquisition**: User authenticates with email/password to receive a signed JWT token and user profile with assigned role and manager mapping.
 2. **Retrieve Question Templates**: Frontend fetches active question templates (Accomplishments, In Progress, Blockers, Next Week Priorities).
@@ -107,3 +107,5 @@ JWT_EXPIRE_MINUTES=1440
 # MongoDB Connection String (e.g., MongoDB Atlas or local instance)
 MONGODB_URI=mongodb+srv://<username>:<password>@cluster0.mongodb.net/?retryWrites=true&w=majority
 DATABASE_NAME=workpulse_db
+
+
